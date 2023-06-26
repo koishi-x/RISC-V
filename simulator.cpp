@@ -121,7 +121,7 @@ public:
             case 0b0010011: //ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI
                 detailType = getBit(x, 12, 14);
                 if (detailType == 0b001 || detailType == 0b101) {   //SLLI, SRLI, SRAI
-                    //todo
+
                     imm = getBit(x, 20, 24);    //imm means shamt here.
 
                     if (detailType == 0b001) type = SLLI;
