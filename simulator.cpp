@@ -17,8 +17,8 @@ inline unsigned sext(unsigned x, int high) {return (x >> high) & 1 ? x | (FULL_B
 
 bool flagEnd;
 unsigned pc, pc_new;
-unsigned reg_old[MAX_REGISTER_NUM], reg_new[MAX_REGISTER_NUM];
-unsigned RF_old[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
+unsigned reg[MAX_REGISTER_NUM], reg_new[MAX_REGISTER_NUM];
+unsigned RF[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
 unsigned FZYC[1<<12], FZYC_new[1<<12], FZYC_modify_id;
 
 class Memory {
@@ -66,7 +66,13 @@ bool isBType(orderType x) {return x >= BEQ && x <= BGEU; }
 bool isSType(orderType x) {return x >= SB && x <= SW; }
 bool isRType(orderType x) {return x >= ADD && x <= AND; }
 
-bool isBranch(orderType x) {return x >= JAL && x <= SRAI; }
+bool isBranch(orderType x) {return x == JAL || x == JALR || isBType(x); }
+bool isLoad(orderType x) {return x >= LB && x <= LHU; }
+bool isStore(orderType x) {return isSType(x); }
+bool isSL(orderType x) {return isLoad(x) || isStore(x); }
+bool hasRD(orderType x) {return isUType(x) || isJType(x) || isIType(x) || isRType(x); }
+bool hasRS1(orderType x) {return !(isUType(x) || isJType(x)); }
+bool hasRS2(orderType x) {return isBType(x) || isSType(x) || isRType(x);}
 
 class Instruction {
 public:
@@ -197,7 +203,7 @@ public:
 
 class ROB_node: public Instruction {
 public:
-    bool busy, ready;
+    bool ready{0};
 
     //information of result
     unsigned value;
@@ -209,17 +215,17 @@ public:
 
 class RS_node: public Instruction {
 public:
-    bool busy;
+    bool busy{0};
 
-    unsigned qj, qk, vj, vk, ROB_id;
-    unsigned value, pc, next_pc;
+    unsigned qj{0}, qk{0}, vj, vk, ROB_id;
+    unsigned value;
 };
 
 class SL_node: public Instruction {
 public:
-    bool busy, ready;   //"ready" is only used in store
+    bool ready{0};   //"ready" is only used in store
 
-    unsigned qj, qk, vj, vk, ROB_id;
+    unsigned qj{0}, qk{0}, vj, vk, ROB_id;
     unsigned value;
 };
 
@@ -229,12 +235,22 @@ class Buffer {  //actually a queue.
     T buffer[MAX_BUFFER_SIZE];
     int head, tail, siz;
 public:
+    //friend void CBD_update(unsigned, unsigned);
+    //friend void work_RS();
     Buffer(): head(1), tail(0), siz(0) {}
 
+    T& operator[](unsigned index) {
+        return buffer[index];
+    }
     T front() {
         return buffer[head];
     }
-
+    int front_id() {
+        return head;
+    }
+    int back_id() {
+        return tail;
+    }
     void push(const T &obj) {
         if (++tail == MAX_BUFFER_SIZE) tail = 0;
         buffer[tail] = obj;
@@ -254,10 +270,44 @@ public:
         return siz == MAX_BUFFER_SIZE;
     }
 };
-Buffer<Instruction> ins_que;
-Buffer<ROB_node> ROB;
-Buffer<SL_node> SLB;
-RS_node RS[MAX_BUFFER_SIZE];
+Buffer<Instruction> insQue, insQue_new;
+Buffer<ROB_node> ROB, ROB_new;
+Buffer<SL_node> SLB, SLB_new;
+RS_node RS[MAX_BUFFER_SIZE], RS_new[MAX_BUFFER_SIZE];
+
+bool dealDependence(unsigned reg_id, unsigned &q, unsigned &v) {
+    if (RF[reg_id] == 0) {
+        q = 0;
+        v = reg[reg_id];
+        return true;
+    } else {
+        q = RF[reg_id];
+        return false;
+    }
+}
+
+void CBD_update(unsigned ROB_id, unsigned value) {
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+        if (SLB[i].qj == ROB_id) {
+            SLB_new[i].qj = 0;
+            SLB_new[i].vj = value;
+        }
+        if (SLB[i].qk == ROB_id) {
+            SLB_new[i].qk = 0;
+            SLB_new[i].vk = value;
+        }
+        if (RS[i].busy) {
+            if (RS[i].qj == ROB_id) {
+                RS_new[i].qj = 0;
+                RS_new[i].vj = value;
+            }
+            if (RS[i].qk == ROB_id) {
+                RS_new[i].qk = 0;
+                RS_new[i].vk = value;
+            }
+        }
+    }
+}
 
 void initMemory() {
     char s[100];
@@ -292,7 +342,7 @@ void readInstruction() {
         flagEnd = true;
         return;
     }
-    if (ins_que.full()) {
+    if (insQue.full()) {
         return;
     }
     curInstruction.pc = pc;
@@ -309,18 +359,252 @@ void readInstruction() {
             curInstruction.next_pc = pc + curInstruction.imm;
             pc_new = curInstruction.predict ? curInstruction.next_pc : pc + 4;
         }
+    } else {
+        pc_new = pc + 4;
     }
+    insQue_new.push(curInstruction);
 }
 
 void issueInstruction() {
 
-    if (ins_que.empty()) return;
-    Instruction cur = ins_que.front();
-    ins_que.pop();
+    if (insQue.empty()) return;
+    if (ROB.full()) return;
+    Instruction cur = insQue.front();
 
     ROB_node tmp;
     tmp.init(cur);
-    tmp.
+
+    if (isSL(cur.type)) {
+        if (SLB.full()) return;
+        ROB_new.push(tmp);
+        insQue_new.pop();
+
+        SL_node tmpSL;
+        tmpSL.init(cur);
+        tmpSL.ROB_id = ROB_new.back_id();
+
+        if (hasRS1(cur.type)) dealDependence(tmpSL.rs1, tmpSL.qj, tmpSL.vj);
+        if (hasRS2(cur.type)) dealDependence(tmpSL.rs2, tmpSL.qk, tmpSL.vk);
+
+        SLB_new.push(tmpSL);
+        if (hasRD(cur.type)) RF_new[cur.rd] = tmpSL.ROB_id;
+    }
+    else {
+        int pos = -1;
+        for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+            if (!RS[i].busy) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos == -1) return;
+
+        ROB_new.push(tmp);
+        insQue_new.pop();
+
+        RS_node tmpRS;
+        tmpRS.init(cur);
+        tmpRS.ROB_id = ROB_new.back_id();
+
+        if (hasRS1(cur.type)) dealDependence(tmpRS.rs1, tmpRS.qj, tmpRS.vj);
+        if (hasRS2(cur.type)) dealDependence(tmpRS.rs2, tmpRS.qk, tmpRS.vk);
+        tmpRS.busy = true;
+        RS_new[pos] = tmpRS;
+        if (hasRD(cur.type)) RF_new[cur.rd] = tmpRS.ROB_id;
+    }
+}
+
+void work_RS() {
+    int pos = -1;
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+        if (RS[i].busy && RS[i].qj == 0 && RS[i].qk == 0) {
+            pos = i;
+            break;
+        }
+    }
+    if (pos == -1) return;
+    unsigned ROB_id = RS[pos].ROB_id;
+
+    RS_new[pos].busy = false;
+    ROB_new[ROB_id].ready = true;
+
+
+    switch (RS[pos].type) {
+        //branch type
+        case JAL:
+            ROB_new[ROB_id].fact = true;
+            ROB_new[ROB_id].value = RS[pos].pc + 4;
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case JALR:
+            ROB_new[ROB_id].fact = false;
+            ROB_new[ROB_id].value = RS[pos].pc + 4;
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            ROB_new[ROB_id].next_pc = RS[pos].vj + ROB[ROB_id].imm;
+            break;
+        case BEQ:
+            ROB_new[ROB_id].fact = (RS[pos].vj == RS[pos].vk);
+            break;
+        case BNE:
+            ROB_new[ROB_id].fact = (RS[pos].vj != RS[pos].vk);
+            break;
+        case BLT:
+            ROB_new[ROB_id].fact = ((int)RS[pos].vj < (int)RS[pos].vk);
+            break;
+        case BGE:
+            ROB_new[ROB_id].fact = ((int)RS[pos].vj >= (int)RS[pos].vk);
+            break;
+        case BLTU:
+            ROB_new[ROB_id].fact = (RS[pos].vj < RS[pos].vk);
+            break;
+        case BGEU:
+            ROB_new[ROB_id].fact = (RS[pos].vj >= RS[pos].vk);
+            break;
+
+        //common type
+        case LUI:
+            ROB_new[ROB_id].value = RS[pos].imm;
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case AUIPC:
+            ROB_new[ROB_id].value = RS[pos].pc + RS[pos].imm;
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case ADDI:
+            ROB_new[ROB_id].value = RS[pos].vj + RS[pos].imm;
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLTI:
+            ROB_new[ROB_id].value = ((int)RS[pos].vj < (int)RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLTIU:
+            ROB_new[ROB_id].value = (RS[pos].vj < RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case XORI:
+            ROB_new[ROB_id].value = (RS[pos].vj ^ RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case ORI:
+            ROB_new[ROB_id].value = (RS[pos].vj | RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case ANDI:
+            ROB_new[ROB_id].value = (RS[pos].vj & RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLLI:
+            ROB_new[ROB_id].value = (RS[pos].vj << RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SRLI:
+            ROB_new[ROB_id].value = (RS[pos].vj >> RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SRAI:
+            ROB_new[ROB_id].value = ((int)RS[pos].vj >> RS[pos].imm);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case ADD:
+            ROB_new[ROB_id].value = (RS[pos].vj + RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SUB:
+            ROB_new[ROB_id].value = (RS[pos].vj - RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLL:
+            ROB_new[ROB_id].value = (RS[pos].vj << (RS[pos].vk & 31));
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLT:
+            ROB_new[ROB_id].value = ((int)RS[pos].vj < (int)RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SLTU:
+            ROB_new[ROB_id].value = (RS[pos].vj < RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case XOR:
+            ROB_new[ROB_id].value = (RS[pos].vj ^ RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SRL:
+            ROB_new[ROB_id].value = (RS[pos].vj >> (RS[pos].vk & 31));
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case SRA:
+            ROB_new[ROB_id].value = ((int)RS[pos].vj >> (RS[pos].vk & 31));
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case OR:
+            ROB_new[ROB_id].value = (RS[pos].vj | RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        case AND:
+            ROB_new[ROB_id].value = (RS[pos].vj & RS[pos].vk);
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            break;
+        default:
+            CHECK_YOUR_XXX();
+    }
+
+    /*
+    if (isBranch(RS[pos].type)) {
+        switch (RS[pos].type) {
+            case JAL:
+                ROB_new[ROB_id].fact = true;
+                ROB_new[ROB_id].value = RS[pos].pc + 4;
+                CBD_update(ROB_id, RS[pos].pc + 4);
+                break;
+            case JALR:
+                ROB_new[ROB_id].fact = false;
+                ROB_new[ROB_id].value = RS[pos].pc + 4;
+                CBD_update(ROB_id, RS[pos].pc + 4);
+                ROB_new[ROB_id].next_pc = RS[pos].vj + ROB[ROB_id].imm;
+                break;
+            case BEQ:
+                ROB_new[ROB_id].fact = (RS[pos].vj == RS[pos].vk);
+                break;
+            case BNE:
+                ROB_new[ROB_id].fact = (RS[pos].vj != RS[pos].vk);
+                break;
+            case BLT:
+                ROB_new[ROB_id].fact = ((int)RS[pos].vj < (int)RS[pos].vk);
+                break;
+            case BGE:
+                ROB_new[ROB_id].fact = ((int)RS[pos].vj >= (int)RS[pos].vk);
+                break;
+            case BLTU:
+                ROB_new[ROB_id].fact = (RS[pos].vj < RS[pos].vk);
+                break;
+            case BGEU:
+                ROB_new[ROB_id].fact = (RS[pos].vj >= RS[pos].vk);
+                break;
+        }
+    }*/
+
+}
+
+void work_SLB() {
+    static signed SLcycle = -1;
+    if (SLcycle != -1) {
+
+    }
+
+    if (SLB.empty()) return;
+    auto tmp = SLB.front();
+    if (isLoad(tmp.type)) {
+        if (tmp.qj) return;
+        SLcycle = 3;
+    } else if (isStore(tmp.type)) {
+        if ()
+    }
+}
+
+void work_ROB() {
+
 }
 
 int main() {
@@ -330,5 +614,8 @@ int main() {
     while (true) {
         readInstruction();
         issueInstruction();
+        work_RS();
+        work_SLB();
+        work_ROB();
     }
 }
