@@ -21,10 +21,11 @@ inline unsigned sext(unsigned x, int high) {return (x >> high) & 1 ? x | (FULL_B
 unsigned CLOCK = 0;
 bool flagEnd, flagEnd_new;
 bool predictFailFlag, predictFailFlag_new;
-unsigned pc, pc_new;
+unsigned pc, pc_new, pc_fact;
 unsigned reg[MAX_REGISTER_NUM], reg_new[MAX_REGISTER_NUM];
 int RF[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
 unsigned FZYC[1<<12], FZYC_new[1<<12], FZYC_modify_id;
+bool isRFModifiedByIssue[MAX_BUFFER_SIZE];
 
 class Memory {
     static const int MAX_MEMORY = 500010;
@@ -330,6 +331,12 @@ public:
     int size() {return siz; }
 };
 
+class CBD_info {
+public:
+    unsigned ROB_id, value;
+};
+vector<CBD_info> CBD;
+
 Buffer<Instruction> insQue, insQue_new;
 Buffer<ROB_node> ROB, ROB_new;
 Buffer<SL_node> SLB, SLB_new;
@@ -352,6 +359,8 @@ bool dealDependence(unsigned reg_id, int &q, unsigned &v) {
 }
 
 void CBD_update(unsigned ROB_id, unsigned value) {
+    CBD.push_back({ROB_id, value});
+    /*
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
         if (SLB[i].qj == ROB_id) {
             SLB_new[i].qj = -1;
@@ -371,7 +380,35 @@ void CBD_update(unsigned ROB_id, unsigned value) {
                 RS_new[i].vk = value;
             }
         }
+    }*/
+
+}
+
+void CBD_update_all() {
+    for (auto cur: CBD) {
+        unsigned ROB_id = cur.ROB_id, value = cur.value;
+        for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+            if (SLB[i].qj == ROB_id) {
+                SLB[i].qj = SLB_new[i].qj = -1;
+                SLB[i].vj = SLB_new[i].vj = value;
+            }
+            if (SLB[i].qk == ROB_id) {
+                SLB[i].qk = SLB_new[i].qk = -1;
+                SLB[i].vk = SLB_new[i].vk = value;
+            }
+            if (RS[i].busy) {
+                if (RS[i].qj == ROB_id) {
+                    RS[i].qj = RS_new[i].qj = -1;
+                    RS[i].vj = RS_new[i].vj = value;
+                }
+                if (RS[i].qk == ROB_id) {
+                    RS[i].qk = RS_new[i].qk = -1;
+                    RS[i].vk = RS_new[i].vk = value;
+                }
+            }
+        }
     }
+    CBD.clear();
 }
 
 void initMemory() {
@@ -404,6 +441,7 @@ void readInstruction() {
 
     curState = false;
     */
+
     if (predictFailFlag) {
         insQue.clear();
         insQue_new.clear();
@@ -489,7 +527,7 @@ void issueInstruction() {
             tmpSL.qk = -1;
         }
         SLB_new.push(tmpSL);
-        if (hasRD(cur.type)) RF_new[cur.rd] = tmpSL.ROB_id;
+        if (hasRD(cur.type)) RF_new[cur.rd] = tmpSL.ROB_id, isRFModifiedByIssue[cur.rd] = true;
     } else {
         int pos = -1;
         for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
@@ -519,7 +557,7 @@ void issueInstruction() {
         }
         tmpRS.busy = true;
         RS_new[pos] = tmpRS;
-        if (hasRD(cur.type)) RF_new[cur.rd] = tmpRS.ROB_id;
+        if (hasRD(cur.type)) RF_new[cur.rd] = tmpRS.ROB_id, isRFModifiedByIssue[cur.rd] = true;
     }
 
 }
@@ -793,7 +831,7 @@ void work_SLB() {
 
 int predictSuccess = 0, predictTot = 0;
 
-
+/*
 void clearAll() {
     insQue.clear(); insQue_new.clear();
     ROB.clear(); ROB_new.clear();
@@ -804,7 +842,7 @@ void clearAll() {
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RF_new[i] = -1;
     predictFailFlag_new = 0;
 }
-
+*/
 
 void work_ROB() {
     if (predictFailFlag) {
@@ -853,7 +891,7 @@ void work_ROB() {
     if (hasRD(tmp.type)) {
         CBD_update(ROB_id, tmp.value);
         reg_new[tmp.rd] = tmp.value;
-        if (RF[tmp.rd] == ROB_id) {
+        if (RF[tmp.rd] == ROB_id && !isRFModifiedByIssue[tmp.rd]) {
             RF_new[tmp.rd] = -1;
         }
         /*
@@ -874,7 +912,7 @@ void work_ROB() {
         } else {
             FZYC_modify_id = (tmp.imm & 0xFFF);
             if (FZYC[FZYC_modify_id] > 0) --FZYC_new[FZYC_modify_id];
-            pc_new = tmp.fact ? tmp.next_pc : tmp.pc + 4;
+            pc_fact = tmp.fact ? tmp.next_pc : tmp.pc + 4;
             predictFailFlag_new = true;
         }
         /*
@@ -897,6 +935,7 @@ void updateAll() {
 
     if (predictFailFlag) {
         predictFailFlag = false;
+        pc = pc_new = pc_fact;
         return;
     }
     insQue = insQue_new;
@@ -906,6 +945,7 @@ void updateAll() {
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
 
         RS[i] = RS_new[i], RF[i] = RF_new[i], reg[i] = reg_new[i];
+        isRFModifiedByIssue[i] = false;
     }
     RF[0] = RF_new[0] = -1, reg[0] = reg_new[0] = 0;
     flagEnd = flagEnd_new;
@@ -913,6 +953,7 @@ void updateAll() {
     predictFailFlag = predictFailFlag_new;
     predictFailFlag_new = false;
     FZYC[FZYC_modify_id] = FZYC_new[FZYC_modify_id];
+    CBD_update_all();
 }
 
 int getRSSize() {
@@ -962,11 +1003,11 @@ int main() {
 */
         ++CLOCK;
         //posedge
-        readInstruction();
-        work_RS();
+        issueInstruction();
         work_SLB();
         work_ROB();
-        issueInstruction();
+        work_RS();
+        readInstruction();
 
         //negedge
         //if (predictFailFlag_new) clearAll();
