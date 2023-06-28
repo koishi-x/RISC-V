@@ -26,18 +26,13 @@ unsigned reg[MAX_REGISTER_NUM], reg_new[MAX_REGISTER_NUM];
 int RF[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
 unsigned FZYC[1<<12], FZYC_new[1<<12], FZYC_modify_id;
 bool isRFModifiedByIssue[MAX_BUFFER_SIZE];
+int predictSuccess = 0, predictTot = 0;
 
 class Memory {
     static const int MAX_MEMORY = 500010;
     unsigned store[MAX_MEMORY];
 public:
     void modify(unsigned value, int addr, int siz) {
-#ifdef DEBUG
-        if (9 >= addr && 9 <= addr + siz - 1) {
-            cout << "Bad pc and clock: " << hex << pc <<dec<<' '<< CLOCK <<endl;
-            cout << value << ' ' << addr << ' ' <<siz << endl << endl;
-        }
-#endif
         if (siz == 1) {
             store[addr] = getBit(value, 0, 7);
         } else if (siz == 2) {
@@ -213,7 +208,6 @@ public:
             default:
                 return false;
                 CHECK_YOUR_XXX(114514);
-                std::cout << x <<' '<<pc<<' '<<CLOCK<< std::endl;
         }
         return true;
     }
@@ -224,7 +218,6 @@ public:
         pc = obj.pc, next_pc = obj.next_pc;
         predict = obj.predict;
     }
-    void clear() {}
     void printInfo() {
         cout << "Type: " << orderString[type] << endl;
         cout << "pc: 0x" << hex << pc << dec << endl;
@@ -244,11 +237,6 @@ public:
 
     //only used for branch
     bool fact;
-
-    void clear() {
-        ready = false;
-    }
-
 };
 
 class RS_node: public Instruction {
@@ -267,10 +255,6 @@ public:
     int qj{-1}, qk{-1};
     unsigned vj, vk, ROB_id;
     unsigned value;
-    void clear() {
-        ready = 0;
-        qj = qk = -1;
-    }
 };
 
 
@@ -280,8 +264,6 @@ class Buffer {  //actually a queue.
     T buffer[MAX_BUFFER_SIZE];
     int head, tail, siz;
 public:
-    //friend void CBD_update(unsigned, unsigned);
-    //friend void work_RS();
     Buffer(): head(1), tail(0), siz(0) {}
 
     T& operator[](unsigned index) {
@@ -303,7 +285,6 @@ public:
     }
 
     void pop() {
-        //buffer[head].clear();
         if (++head == MAX_BUFFER_SIZE) head = 0;
         --siz;
     }
@@ -360,28 +341,6 @@ bool dealDependence(unsigned reg_id, int &q, unsigned &v) {
 
 void CBD_update(unsigned ROB_id, unsigned value) {
     CBD.push_back({ROB_id, value});
-    /*
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
-        if (SLB[i].qj == ROB_id) {
-            SLB_new[i].qj = -1;
-            SLB_new[i].vj = value;
-        }
-        if (SLB[i].qk == ROB_id) {
-            SLB_new[i].qk = -1;
-            SLB_new[i].vk = value;
-        }
-        if (RS[i].busy) {
-            if (RS[i].qj == ROB_id) {
-                RS_new[i].qj = -1;
-                RS_new[i].vj = value;
-            }
-            if (RS[i].qk == ROB_id) {
-                RS_new[i].qk = -1;
-                RS_new[i].vk = value;
-            }
-        }
-    }*/
-
 }
 
 void CBD_update_all() {
@@ -427,43 +386,23 @@ void initMemory() {
 }
 
 void readInstruction() {
-    /*
-    //unsigned curInstruction = mem.query(pc, 4);
-    static bool curState = 0;
-    static unsigned x;
-
-
-    if (!curState) {
-        x = mem.query(pc, 4);
-        curState = true;
-        return;
-    }
-
-    curState = false;
-    */
-
     if (predictFailFlag) {
         insQue.clear();
         insQue_new.clear();
         flagEnd = false;
-        //puts("Return reason: predict fail.");
         return;
     }
 
     Instruction curInstruction;
     unsigned x = mem.query(pc, 4);
     if (!curInstruction.init(x)) {
-        //puts("Return reason: invalid operation.");
         return;
     }
-    //cout << "Query: "<<hex<<x <<" at clock " << CLOCK <<" in pc " <<pc<< endl;
     if (curInstruction.type == END) {
-        //puts("Return reason: end program.");
         flagEnd_new = true;
         return;
     }
     if (insQue.full()) {
-     //   puts("Return reason: instruction queue full.");
         return;
     }
     curInstruction.pc = pc;
@@ -483,11 +422,7 @@ void readInstruction() {
     } else {
         pc_new = pc + 4;
     }
-#ifdef DEBUG
-    cout << "###############\n";
-    curInstruction.printInfo();
-    cout << "#################\n";
-#endif
+
     insQue_new.push(curInstruction);
 }
 
@@ -559,7 +494,105 @@ void issueInstruction() {
         RS_new[pos] = tmpRS;
         if (hasRD(cur.type)) RF_new[cur.rd] = tmpRS.ROB_id, isRFModifiedByIssue[cur.rd] = true;
     }
+}
 
+void Execution(const RS_node cur, unsigned &value) {
+    switch (cur.type) {
+        case JAL:
+            value = cur.pc + 4;
+            break;
+        case JALR:
+            value = cur.pc + 4;
+            //ROB_new[ROB_id].next_pc = (cur.vj + ROB[ROB_id].imm) & (~1);
+            break;
+        case BEQ:
+            value = (cur.vj == cur.vk);
+            break;
+        case BNE:
+            value = (cur.vj != cur.vk);
+            break;
+        case BLT:
+            value = ((int)cur.vj < (int)cur.vk);
+            break;
+        case BGE:
+            value = ((int)cur.vj >= (int)cur.vk);
+            break;
+        case BLTU:
+            value = (cur.vj < cur.vk);
+            break;
+        case BGEU:
+            value = (cur.vj >= cur.vk);
+            break;
+
+        //common type
+        case LUI:
+            value = cur.imm;
+            break;
+        case AUIPC:
+            value = cur.pc + cur.imm;
+            break;
+        case ADDI:
+            value = cur.vj + cur.imm;
+
+            break;
+        case SLTI:
+            value = ((int)cur.vj < (int)cur.imm);
+            break;
+        case SLTIU:
+            value = (cur.vj < cur.imm);
+            break;
+        case XORI:
+            value = (cur.vj ^ cur.imm);
+            break;
+        case ORI:
+            value = (cur.vj | cur.imm);
+            break;
+        case ANDI:
+            value = (cur.vj & cur.imm);
+            break;
+        case SLLI:
+            value = (cur.vj << cur.imm);
+            break;
+        case SRLI:
+            value = (cur.vj >> cur.imm);
+            break;
+        case SRAI:
+            value = ((int)cur.vj >> cur.imm);
+            break;
+        case ADD:
+            value = (cur.vj + cur.vk);
+            break;
+        case SUB:
+            value = (cur.vj - cur.vk);
+            break;
+        case SLL:
+            value = (cur.vj << (cur.vk & 31u));
+            break;
+        case SLT:
+            value = ((int)cur.vj < (int)cur.vk);
+            break;
+        case SLTU:
+            value = (cur.vj < cur.vk);
+            break;
+        case XOR:
+            value = (cur.vj ^ cur.vk);
+            break;
+        case SRL:
+            value = (cur.vj >> (cur.vk & 31u));
+            break;
+        case SRA:
+            value = ((int)cur.vj >> (cur.vk & 31u));
+            break;
+        case OR:
+            value = (cur.vj | cur.vk);
+            break;
+        case AND:
+            value = (cur.vj & cur.vk);
+            break;
+        default:
+            CHECK_YOUR_XXX(9);
+            std::cout << cur.type<<' '<<hex<<pc<<dec<<endl;
+    }
 }
 
 void work_RS() {
@@ -587,168 +620,22 @@ void work_RS() {
     RS_new[pos].busy = false;
     ROB_new[ROB_id].ready = true;
 
-
-    switch (RS[pos].type) {
-        //branch type
-        case JAL:
-            ROB_new[ROB_id].fact = true;
-            ROB_new[ROB_id].value = RS[pos].pc + 4;
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case JALR:
-            ROB_new[ROB_id].fact = true;
-            ROB_new[ROB_id].value = RS[pos].pc + 4;
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            ROB_new[ROB_id].next_pc = (RS[pos].vj + ROB[ROB_id].imm) & (~1);
-            break;
-        case BEQ:
-            ROB_new[ROB_id].fact = (RS[pos].vj == RS[pos].vk);
-            break;
-        case BNE:
-            ROB_new[ROB_id].fact = (RS[pos].vj != RS[pos].vk);
-            break;
-        case BLT:
-            ROB_new[ROB_id].fact = ((int)RS[pos].vj < (int)RS[pos].vk);
-            break;
-        case BGE:
-            ROB_new[ROB_id].fact = ((int)RS[pos].vj >= (int)RS[pos].vk);
-            break;
-        case BLTU:
-            ROB_new[ROB_id].fact = (RS[pos].vj < RS[pos].vk);
-            break;
-        case BGEU:
-            ROB_new[ROB_id].fact = (RS[pos].vj >= RS[pos].vk);
-            break;
-
-        //common type
-        case LUI:
-            ROB_new[ROB_id].value = RS[pos].imm;
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case AUIPC:
-            ROB_new[ROB_id].value = RS[pos].pc + RS[pos].imm;
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case ADDI:
-            ROB_new[ROB_id].value = RS[pos].vj + RS[pos].imm;
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-#ifdef DEBUG
-            cout << "ADDI result: " << ' ' << ROB_new[ROB_id].value << ' ' << ROB_new[ROB_id].pc<<endl;
-            cout << ROB_id << ' ' << RF[2] <<' ' << RF_new[2] << endl;
-#endif
-            break;
-        case SLTI:
-            ROB_new[ROB_id].value = ((int)RS[pos].vj < (int)RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SLTIU:
-            ROB_new[ROB_id].value = (RS[pos].vj < RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case XORI:
-            ROB_new[ROB_id].value = (RS[pos].vj ^ RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case ORI:
-            ROB_new[ROB_id].value = (RS[pos].vj | RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case ANDI:
-            ROB_new[ROB_id].value = (RS[pos].vj & RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SLLI:
-            ROB_new[ROB_id].value = (RS[pos].vj << RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SRLI:
-            ROB_new[ROB_id].value = (RS[pos].vj >> RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SRAI:
-            ROB_new[ROB_id].value = ((int)RS[pos].vj >> RS[pos].imm);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case ADD:
-            ROB_new[ROB_id].value = (RS[pos].vj + RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SUB:
-            ROB_new[ROB_id].value = (RS[pos].vj - RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SLL:
-            ROB_new[ROB_id].value = (RS[pos].vj << (RS[pos].vk & 31u));
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SLT:
-            ROB_new[ROB_id].value = ((int)RS[pos].vj < (int)RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SLTU:
-            ROB_new[ROB_id].value = (RS[pos].vj < RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case XOR:
-            ROB_new[ROB_id].value = (RS[pos].vj ^ RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SRL:
-            ROB_new[ROB_id].value = (RS[pos].vj >> (RS[pos].vk & 31u));
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case SRA:
-            ROB_new[ROB_id].value = ((int)RS[pos].vj >> (RS[pos].vk & 31u));
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case OR:
-            ROB_new[ROB_id].value = (RS[pos].vj | RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        case AND:
-            ROB_new[ROB_id].value = (RS[pos].vj & RS[pos].vk);
-            CBD_update(ROB_id, ROB_new[ROB_id].value);
-            break;
-        default:
-            CHECK_YOUR_XXX(9);
-            std::cout << RS[pos].type<<' '<<hex<<pc<<dec<<endl;
-    }
-
-    /*
+    unsigned value;
+    Execution(RS[pos], ROB_new[ROB_id].value);
     if (isBranch(RS[pos].type)) {
-        switch (RS[pos].type) {
-            case JAL:
-                ROB_new[ROB_id].fact = true;
-                ROB_new[ROB_id].value = RS[pos].pc + 4;
-                CBD_update(ROB_id, RS[pos].pc + 4);
-                break;
-            case JALR:
-                ROB_new[ROB_id].fact = false;
-                ROB_new[ROB_id].value = RS[pos].pc + 4;
-                CBD_update(ROB_id, RS[pos].pc + 4);
-                ROB_new[ROB_id].next_pc = RS[pos].vj + ROB[ROB_id].imm;
-                break;
-            case BEQ:
-                ROB_new[ROB_id].fact = (RS[pos].vj == RS[pos].vk);
-                break;
-            case BNE:
-                ROB_new[ROB_id].fact = (RS[pos].vj != RS[pos].vk);
-                break;
-            case BLT:
-                ROB_new[ROB_id].fact = ((int)RS[pos].vj < (int)RS[pos].vk);
-                break;
-            case BGE:
-                ROB_new[ROB_id].fact = ((int)RS[pos].vj >= (int)RS[pos].vk);
-                break;
-            case BLTU:
-                ROB_new[ROB_id].fact = (RS[pos].vj < RS[pos].vk);
-                break;
-            case BGEU:
-                ROB_new[ROB_id].fact = (RS[pos].vj >= RS[pos].vk);
-                break;
+        if (RS[pos].type == JAL) {
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            ROB_new[ROB_id].fact = true;
+        } else if (RS[pos].type == JALR) {
+            CBD_update(ROB_id, ROB_new[ROB_id].value);
+            ROB_new[ROB_id].fact = true;
+            ROB_new[ROB_id].next_pc = (RS[pos].vj + ROB[ROB_id].imm) & (~1);
+        } else {
+            ROB_new[ROB_id].fact = ROB_new[ROB_id].value;
         }
-    }*/
-
+    } else {
+        CBD_update(ROB_id, ROB_new[ROB_id].value);
+    }
 }
 
 signed SLcycle = 0;
@@ -759,7 +646,6 @@ void work_SLB() {
         SLcycle = 0;
         return;
     }
-
     if (SLcycle) {
         --SLcycle;
         if (SLcycle == 0) {
@@ -770,12 +656,7 @@ void work_SLB() {
 
             FUCK_vj[ROB_id] = tmp.vj;
             FUCK_vk[ROB_id] = tmp.vk;
-#ifdef DEBUG2
-            if (CLOCK == 82 || CLOCK == 224) {
-                cout << "pc: " << hex << tmp.pc << ',';
-                cout << tmp.type << ' ' << tmp.vj << ' ' << tmp.vk << ' ' << tmp.imm << endl;
-            }
-#endif
+
             switch (tmp.type) {
                 case LB:
                     ROB_new[ROB_id].value = sext(mem.query(tmp.vj + tmp.imm, 1), 7);
@@ -788,11 +669,6 @@ void work_SLB() {
                 case LW:
                     ROB_new[ROB_id].value = mem.query(tmp.vj + tmp.imm, 4); //no need to sign-extend in RV32I.
                     CBD_update(ROB_id, ROB_new[ROB_id].value);
-#ifdef DEBUG
-                    if (tmp.pc == 0x1060) {
-                        cout << "QWQ: " << ROB_new[ROB_id].value << ' ' << RF[tmp.rd] << ' ' << RF_new[tmp.rd] << ' ' << ROB_id<<endl;
-                    }
-#endif
                     break;
                 case LBU:
                     ROB_new[ROB_id].value = mem.query(tmp.vj + tmp.imm, 1);
@@ -815,7 +691,6 @@ void work_SLB() {
         }
         return;
     }
-
     if (SLB.empty()) return;
     SL_node tmp = SLB.front();
     if (isLoad(tmp.type)) {
@@ -829,21 +704,6 @@ void work_SLB() {
     } else CHECK_YOUR_XXX(10);
 }
 
-int predictSuccess = 0, predictTot = 0;
-
-/*
-void clearAll() {
-    insQue.clear(); insQue_new.clear();
-    ROB.clear(); ROB_new.clear();
-    SLB.clear(); SLB_new.clear();
-    SLcycle = 0;
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RS[i].busy = RS_new[i].busy = false;
-    flagEnd_new = false;
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RF_new[i] = -1;
-    predictFailFlag_new = 0;
-}
-*/
-
 void work_ROB() {
     if (predictFailFlag) {
         ROB.clear();
@@ -854,29 +714,6 @@ void work_ROB() {
     auto tmp = ROB.front();
     unsigned ROB_id = ROB.front_id();
 
-#ifdef DEBUG
-    static int last_ROB_id = -1;
-
-
-    if (ROB_id != last_ROB_id) {
-        if (last_ROB_id != -1) {
-            cout << "vj: " << FUCK_vj[last_ROB_id] << endl;
-            cout << "vk: " << FUCK_vk[last_ROB_id] << endl << endl;
-        }
-        tmp.printInfo(), last_ROB_id = ROB_id;
-    }
-#endif
-#ifdef DEBUG3
-    static int last_ROB_id = 0;
-
-    if (ROB_id != last_ROB_id) {
-        tmp.printInfo(), last_ROB_id = ROB_id;
-        cout << "RF[8]: " << RF[8] << endl;
-    }
-    if (ROB_id == 5) {
-        exit(1);
-    }
-#endif
     if (!tmp.ready) {
         if (isStore(tmp.type)) {
             for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
@@ -894,15 +731,7 @@ void work_ROB() {
         if (RF[tmp.rd] == ROB_id && !isRFModifiedByIssue[tmp.rd]) {
             RF_new[tmp.rd] = -1;
         }
-        /*
-        for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
-            if (RF[i] == ROB_id) {
-                RF_new[i] = 0;
-                reg_new[i] = tmp.value;
-            }
-        }*/
     }
-
     if (isBranch(tmp.type)) {
         ++predictTot;
         if (tmp.predict == tmp.fact) {
@@ -915,21 +744,8 @@ void work_ROB() {
             pc_fact = tmp.fact ? tmp.next_pc : tmp.pc + 4;
             predictFailFlag_new = true;
         }
-        /*
-        if (tmp.type == JAL) {
-            ++predictSuccess;
-            FZYC_modify_id = (tmp.imm & 0xFFF);
-            if (FZYC[FZYC_modify_id] < 3) ++FZYC_new[FZYC_modify_id];
-        } else if (tmp.type == JALR) {
-            predictFail = true;
-            FZYC_modify_id = (tmp.imm & 0xFFF);
-            if (FZYC_modify_id > 0) --FZYC_new[FZYC_modify_id];
-        } else {
-            if ()
-        }*/
     }
 }
-
 
 void updateAll() {
 
@@ -943,7 +759,6 @@ void updateAll() {
     SLB = SLB_new;
     pc = pc_new;
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
-
         RS[i] = RS_new[i], RF[i] = RF_new[i], reg[i] = reg_new[i];
         isRFModifiedByIssue[i] = false;
     }
@@ -956,22 +771,6 @@ void updateAll() {
     CBD_update_all();
 }
 
-int getRSSize() {
-    int res = 0;
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) res += RS[i].busy;
-    return res;
-}
-
-int getReadyROB() {
-    int res = 0;
-    for (int i = ROB.front_id();;++i) {
-        if (i == MAX_BUFFER_SIZE) i = 0;
-        res += ROB[i].ready;
-        if (i == ROB.back_id()) break;
-    }
-    return res;
-}
-
 int main() {
     //freopen("testcases/tak.data", "r", stdin);
     //freopen("my.out", "w", stdout);
@@ -979,28 +778,6 @@ int main() {
     flagEnd = false;
     pc = 0;
     while (true) {
-        /*
-
-        if (ROB.front_id() == 7) {
-             cout<<"";
-                  /*
-         if (ROB.front_id() == 8) {
-             cout << hex<<ROB[8].pc << dec<<' ' << ROB[8].type << endl;
-             int pos = -1;
-             for (int i = 0; i < MAX_BUFFER_SIZE; ++i)
-                 if (RS[i].ROB_id == 8) {
-                     std::cout << RS[i].qj << ' ' << RS[i].qk << endl;
-                 }
-         }
-        */
-/*
-        cout << "Current pc: " << hex << pc << endl;
-        std::cout << "ROB size: " << dec<<ROB.size() << endl;
-        cout << "Ready ROB node: " << getReadyROB() <<"/" <<ROB.front_id()<< endl;
-        cout << "SLB size: " << SLB.size() << endl;
-        cout << "RS size: " << getRSSize() << endl;
-        cout << "ins_que size: " << insQue.size() << endl<<endl;
-*/
         ++CLOCK;
         //posedge
         issueInstruction();
@@ -1010,7 +787,6 @@ int main() {
         readInstruction();
 
         //negedge
-        //if (predictFailFlag_new) clearAll();
         updateAll();
         if (flagEnd && insQue.empty() && ROB.empty() && !predictFailFlag) break;
     }
