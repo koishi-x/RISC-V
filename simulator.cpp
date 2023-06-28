@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <queue>
 
+//#define DEBUG
+unsigned FUCK_vj[32], FUCK_vk[32];
+
 using namespace std;
 constexpr unsigned FULL_BIT = -1;
 constexpr unsigned MAX_REGISTER_NUM = 32;
@@ -15,11 +18,12 @@ inline unsigned getBit (unsigned x, int low, int high) {return (x >> low) & (FUL
 inline unsigned charToInt(char c) {return c <= '9' ? c - '0' : c - 'A' + 10; }
 inline unsigned sext(unsigned x, int high) {return (x >> high) & 1 ? x | (FULL_BIT << (high + 1)) : x; }
 
+unsigned CLOCK = 0;
 bool flagEnd, flagEnd_new;
 bool predictFailFlag, predictFailFlag_new;
 unsigned pc, pc_new;
 unsigned reg[MAX_REGISTER_NUM], reg_new[MAX_REGISTER_NUM];
-unsigned RF[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
+int RF[MAX_REGISTER_NUM], RF_new[MAX_REGISTER_NUM];
 unsigned FZYC[1<<12], FZYC_new[1<<12], FZYC_modify_id;
 
 class Memory {
@@ -27,6 +31,12 @@ class Memory {
     unsigned store[MAX_MEMORY];
 public:
     void modify(unsigned value, int addr, int siz) {
+#ifdef DEBUG
+        if (9 >= addr && 9 <= addr + siz - 1) {
+            cout << "Bad pc and clock: " << hex << pc <<dec<<' '<< CLOCK <<endl;
+            cout << value << ' ' << addr << ' ' <<siz << endl << endl;
+        }
+#endif
         if (siz == 1) {
             store[addr] = getBit(value, 0, 7);
         } else if (siz == 2) {
@@ -60,6 +70,13 @@ enum orderType {
     END
 };
 
+string orderString[] = {"LUI","AUIPC",
+                        "JAL",
+                        "JALR","LB","LH","LW","LBU","LHU","ADDI","SLTI","SLTIU","XORI","ORI","ANDI","SLLI","SRLI","SRAI",
+                        "BEQ","BNE","BLT","BGE","BLTU","BGEU",
+                        "SB","SH","SW",
+                        "ADD","SUB","SLL","SLT","SLTU","XOR","SRL","SRA","OR","AND",
+                        "END"};
 bool isUType(orderType x) {return x >= LUI && x <= AUIPC; }
 bool isJType(orderType x) {return x == JAL;}
 bool isIType(orderType x) {return x >= JALR && x <= SRAI; }
@@ -86,10 +103,10 @@ public:
     bool predict;
     Instruction() {}
 
-    void init(unsigned x) {
+    bool init(unsigned x) {
         if (x == 0x0ff00513) {
             type = END;
-            return;
+            return true;
         }
         int typeId, detailType;
         typeId = getBit(x, 0, 6);
@@ -191,7 +208,13 @@ public:
                     else if (detailType == 0b111) type = AND;
                     else CHECK_YOUR_XXX(7);
                 } else CHECK_YOUR_XXX(8);
+                break;
+            default:
+                return false;
+                CHECK_YOUR_XXX(114514);
+                std::cout << x <<' '<<pc<<' '<<CLOCK<< std::endl;
         }
+        return true;
     }
     void init(const Instruction &obj) {
         rs1 = obj.rs1, rs2 = obj.rs2, rd = obj.rd;
@@ -199,6 +222,15 @@ public:
         type = obj.type;
         pc = obj.pc, next_pc = obj.next_pc;
         predict = obj.predict;
+    }
+    void clear() {}
+    void printInfo() {
+        cout << "Type: " << orderString[type] << endl;
+        cout << "pc: 0x" << hex << pc << dec << endl;
+        if (hasRD(type)) cout << "rd: " << rd << endl;
+        if (hasRS1(type)) cout << "rs1: " << rs1 << endl;
+        if (hasRS2(type)) cout << "rs2: " << rs2 << endl;
+        cout << "imm: " << imm << endl;
     }
 };
 
@@ -212,13 +244,18 @@ public:
     //only used for branch
     bool fact;
 
+    void clear() {
+        ready = false;
+    }
+
 };
 
 class RS_node: public Instruction {
 public:
     bool busy{0};
 
-    unsigned qj{0}, qk{0}, vj, vk, ROB_id;
+    int qj{-1}, qk{-1};
+    unsigned vj, vk, ROB_id;
     unsigned value;
 };
 
@@ -226,9 +263,15 @@ class SL_node: public Instruction {
 public:
     bool ready{0};   //"ready" is only used in store
 
-    unsigned qj{0}, qk{0}, vj, vk, ROB_id;
+    int qj{-1}, qk{-1};
+    unsigned vj, vk, ROB_id;
     unsigned value;
+    void clear() {
+        ready = 0;
+        qj = qk = -1;
+    }
 };
+
 
 template<class T>
 class Buffer {  //actually a queue.
@@ -259,6 +302,7 @@ public:
     }
 
     void pop() {
+        //buffer[head].clear();
         if (++head == MAX_BUFFER_SIZE) head = 0;
         --siz;
     }
@@ -283,6 +327,7 @@ public:
         }
         return *this;
     }
+    int size() {return siz; }
 };
 
 Buffer<Instruction> insQue, insQue_new;
@@ -290,34 +335,39 @@ Buffer<ROB_node> ROB, ROB_new;
 Buffer<SL_node> SLB, SLB_new;
 RS_node RS[MAX_BUFFER_SIZE], RS_new[MAX_BUFFER_SIZE];
 
-bool dealDependence(unsigned reg_id, unsigned &q, unsigned &v) {
-    if (RF[reg_id] == 0) {
-        q = 0;
+bool dealDependence(unsigned reg_id, int &q, unsigned &v) {
+
+    if (RF[reg_id] == -1) {
+        q = -1;
         v = reg[reg_id];
         return true;
-    } else {
+    } else if (!ROB_new[RF[reg_id]].ready){
         q = RF[reg_id];
         return false;
+    } else {
+        q = -1;
+        v = ROB_new[RF[reg_id]].value;
+        return true;
     }
 }
 
 void CBD_update(unsigned ROB_id, unsigned value) {
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
         if (SLB[i].qj == ROB_id) {
-            SLB_new[i].qj = 0;
+            SLB_new[i].qj = -1;
             SLB_new[i].vj = value;
         }
         if (SLB[i].qk == ROB_id) {
-            SLB_new[i].qk = 0;
+            SLB_new[i].qk = -1;
             SLB_new[i].vk = value;
         }
         if (RS[i].busy) {
             if (RS[i].qj == ROB_id) {
-                RS_new[i].qj = 0;
+                RS_new[i].qj = -1;
                 RS_new[i].vj = value;
             }
             if (RS[i].qk == ROB_id) {
-                RS_new[i].qk = 0;
+                RS_new[i].qk = -1;
                 RS_new[i].vk = value;
             }
         }
@@ -327,6 +377,7 @@ void CBD_update(unsigned ROB_id, unsigned value) {
 void initMemory() {
     char s[100];
     int addr = 0;
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RF[i] = RF_new[i] = -1;
     while (~scanf("%s", s)) {
         if (s[0] == '@') {
             addr = 0;
@@ -356,17 +407,25 @@ void readInstruction() {
     if (predictFailFlag) {
         insQue.clear();
         insQue_new.clear();
+        flagEnd = false;
+        //puts("Return reason: predict fail.");
         return;
     }
 
     Instruction curInstruction;
-    curInstruction.init(mem.query(pc, 4));
-
+    unsigned x = mem.query(pc, 4);
+    if (!curInstruction.init(x)) {
+        //puts("Return reason: invalid operation.");
+        return;
+    }
+    //cout << "Query: "<<hex<<x <<" at clock " << CLOCK <<" in pc " <<pc<< endl;
     if (curInstruction.type == END) {
+        //puts("Return reason: end program.");
         flagEnd_new = true;
         return;
     }
     if (insQue.full()) {
+     //   puts("Return reason: instruction queue full.");
         return;
     }
     curInstruction.pc = pc;
@@ -386,6 +445,11 @@ void readInstruction() {
     } else {
         pc_new = pc + 4;
     }
+#ifdef DEBUG
+    cout << "###############\n";
+    curInstruction.printInfo();
+    cout << "#################\n";
+#endif
     insQue_new.push(curInstruction);
 }
 
@@ -393,7 +457,7 @@ void issueInstruction() {
 
     if (predictFailFlag) {
         for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
-            RF[i] = RF_new[i] = 0;
+            RF[i] = RF_new[i] = -1;
         }
         return;
     }
@@ -404,7 +468,7 @@ void issueInstruction() {
 
     ROB_node tmp;
     tmp.init(cur);
-
+    tmp.ready = false;
     if (isSL(cur.type)) {
         if (SLB.full()) return;
         ROB_new.push(tmp);
@@ -413,14 +477,20 @@ void issueInstruction() {
         SL_node tmpSL;
         tmpSL.init(cur);
         tmpSL.ROB_id = ROB_new.back_id();
-
-        if (hasRS1(cur.type)) dealDependence(tmpSL.rs1, tmpSL.qj, tmpSL.vj);
-        if (hasRS2(cur.type)) dealDependence(tmpSL.rs2, tmpSL.qk, tmpSL.vk);
-
+        tmpSL.ready = false;
+        if (hasRS1(cur.type)) {
+            dealDependence(tmpSL.rs1, tmpSL.qj, tmpSL.vj);
+        } else {
+            tmpSL.qj = -1;
+        }
+        if (hasRS2(cur.type)) {
+            dealDependence(tmpSL.rs2, tmpSL.qk, tmpSL.vk);
+        } else {
+            tmpSL.qk = -1;
+        }
         SLB_new.push(tmpSL);
         if (hasRD(cur.type)) RF_new[cur.rd] = tmpSL.ROB_id;
-    }
-    else {
+    } else {
         int pos = -1;
         for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
             if (!RS[i].busy) {
@@ -437,12 +507,21 @@ void issueInstruction() {
         tmpRS.init(cur);
         tmpRS.ROB_id = ROB_new.back_id();
 
-        if (hasRS1(cur.type)) dealDependence(tmpRS.rs1, tmpRS.qj, tmpRS.vj);
-        if (hasRS2(cur.type)) dealDependence(tmpRS.rs2, tmpRS.qk, tmpRS.vk);
+        if (hasRS1(cur.type)) {
+            dealDependence(tmpRS.rs1, tmpRS.qj, tmpRS.vj);
+        } else {
+            tmpRS.qj = -1;
+        }
+        if (hasRS2(cur.type)) {
+            dealDependence(tmpRS.rs2, tmpRS.qk, tmpRS.vk);
+        } else {
+            tmpRS.qk = -1;
+        }
         tmpRS.busy = true;
         RS_new[pos] = tmpRS;
         if (hasRD(cur.type)) RF_new[cur.rd] = tmpRS.ROB_id;
     }
+
 }
 
 void work_RS() {
@@ -456,13 +535,16 @@ void work_RS() {
 
     int pos = -1;
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
-        if (RS[i].busy && RS[i].qj == 0 && RS[i].qk == 0) {
+        if (RS[i].busy && RS[i].qj == -1 && RS[i].qk == -1) {
             pos = i;
             break;
         }
     }
     if (pos == -1) return;
     unsigned ROB_id = RS[pos].ROB_id;
+
+    FUCK_vj[ROB_id] = RS[pos].vj;
+    FUCK_vk[ROB_id] = RS[pos].vk;
 
     RS_new[pos].busy = false;
     ROB_new[ROB_id].ready = true;
@@ -476,10 +558,10 @@ void work_RS() {
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case JALR:
-            ROB_new[ROB_id].fact = false;
+            ROB_new[ROB_id].fact = true;
             ROB_new[ROB_id].value = RS[pos].pc + 4;
             CBD_update(ROB_id, ROB_new[ROB_id].value);
-            ROB_new[ROB_id].next_pc = RS[pos].vj + ROB[ROB_id].imm;
+            ROB_new[ROB_id].next_pc = (RS[pos].vj + ROB[ROB_id].imm) & (~1);
             break;
         case BEQ:
             ROB_new[ROB_id].fact = (RS[pos].vj == RS[pos].vk);
@@ -512,6 +594,10 @@ void work_RS() {
         case ADDI:
             ROB_new[ROB_id].value = RS[pos].vj + RS[pos].imm;
             CBD_update(ROB_id, ROB_new[ROB_id].value);
+#ifdef DEBUG
+            cout << "ADDI result: " << ' ' << ROB_new[ROB_id].value << ' ' << ROB_new[ROB_id].pc<<endl;
+            cout << ROB_id << ' ' << RF[2] <<' ' << RF_new[2] << endl;
+#endif
             break;
         case SLTI:
             ROB_new[ROB_id].value = ((int)RS[pos].vj < (int)RS[pos].imm);
@@ -554,7 +640,7 @@ void work_RS() {
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case SLL:
-            ROB_new[ROB_id].value = (RS[pos].vj << (RS[pos].vk & 31));
+            ROB_new[ROB_id].value = (RS[pos].vj << (RS[pos].vk & 31u));
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case SLT:
@@ -570,11 +656,11 @@ void work_RS() {
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case SRL:
-            ROB_new[ROB_id].value = (RS[pos].vj >> (RS[pos].vk & 31));
+            ROB_new[ROB_id].value = (RS[pos].vj >> (RS[pos].vk & 31u));
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case SRA:
-            ROB_new[ROB_id].value = ((int)RS[pos].vj >> (RS[pos].vk & 31));
+            ROB_new[ROB_id].value = ((int)RS[pos].vj >> (RS[pos].vk & 31u));
             CBD_update(ROB_id, ROB_new[ROB_id].value);
             break;
         case OR:
@@ -587,6 +673,7 @@ void work_RS() {
             break;
         default:
             CHECK_YOUR_XXX(9);
+            std::cout << RS[pos].type<<' '<<hex<<pc<<dec<<endl;
     }
 
     /*
@@ -626,8 +713,8 @@ void work_RS() {
 
 }
 
+signed SLcycle = 0;
 void work_SLB() {
-    static signed SLcycle = 0;
     if (predictFailFlag) {
         SLB.clear();
         SLB_new.clear();
@@ -636,11 +723,21 @@ void work_SLB() {
     }
 
     if (SLcycle) {
-        if (--SLcycle == 0) {
+        --SLcycle;
+        if (SLcycle == 0) {
             SL_node tmp = SLB.front();
             SLB_new.pop();
             unsigned ROB_id = tmp.ROB_id;
             ROB_new[ROB_id].ready = true;
+
+            FUCK_vj[ROB_id] = tmp.vj;
+            FUCK_vk[ROB_id] = tmp.vk;
+#ifdef DEBUG2
+            if (CLOCK == 82 || CLOCK == 224) {
+                cout << "pc: " << hex << tmp.pc << ',';
+                cout << tmp.type << ' ' << tmp.vj << ' ' << tmp.vk << ' ' << tmp.imm << endl;
+            }
+#endif
             switch (tmp.type) {
                 case LB:
                     ROB_new[ROB_id].value = sext(mem.query(tmp.vj + tmp.imm, 1), 7);
@@ -653,6 +750,11 @@ void work_SLB() {
                 case LW:
                     ROB_new[ROB_id].value = mem.query(tmp.vj + tmp.imm, 4); //no need to sign-extend in RV32I.
                     CBD_update(ROB_id, ROB_new[ROB_id].value);
+#ifdef DEBUG
+                    if (tmp.pc == 0x1060) {
+                        cout << "QWQ: " << ROB_new[ROB_id].value << ' ' << RF[tmp.rd] << ' ' << RF_new[tmp.rd] << ' ' << ROB_id<<endl;
+                    }
+#endif
                     break;
                 case LBU:
                     ROB_new[ROB_id].value = mem.query(tmp.vj + tmp.imm, 1);
@@ -673,16 +775,17 @@ void work_SLB() {
                     break;
             }
         }
+        return;
     }
 
     if (SLB.empty()) return;
     SL_node tmp = SLB.front();
     if (isLoad(tmp.type)) {
-        if (tmp.qj == 0) {
+        if (tmp.qj == -1) {
             SLcycle = 3;
         }
     } else if (isStore(tmp.type)) {
-        if (tmp.qj == 0 && tmp.qk == 0 && tmp.ready) {
+        if (tmp.qj == -1 && tmp.qk == -1 && tmp.ready) {
             SLcycle = 3;
         }
     } else CHECK_YOUR_XXX(10);
@@ -690,28 +793,52 @@ void work_SLB() {
 
 int predictSuccess = 0, predictTot = 0;
 
-/*
-void clear() {
+
+void clearAll() {
     insQue.clear(); insQue_new.clear();
     ROB.clear(); ROB_new.clear();
     SLB.clear(); SLB_new.clear();
     SLcycle = 0;
     for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RS[i].busy = RS_new[i].busy = false;
     flagEnd_new = false;
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RF_new[i] = 0;
-
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RF_new[i] = -1;
+    predictFailFlag_new = 0;
 }
-*/
+
 
 void work_ROB() {
     if (predictFailFlag) {
         ROB.clear();
         ROB_new.clear();
-
+        return;
     }
     if (ROB.empty()) return;
     auto tmp = ROB.front();
     unsigned ROB_id = ROB.front_id();
+
+#ifdef DEBUG
+    static int last_ROB_id = -1;
+
+
+    if (ROB_id != last_ROB_id) {
+        if (last_ROB_id != -1) {
+            cout << "vj: " << FUCK_vj[last_ROB_id] << endl;
+            cout << "vk: " << FUCK_vk[last_ROB_id] << endl << endl;
+        }
+        tmp.printInfo(), last_ROB_id = ROB_id;
+    }
+#endif
+#ifdef DEBUG3
+    static int last_ROB_id = 0;
+
+    if (ROB_id != last_ROB_id) {
+        tmp.printInfo(), last_ROB_id = ROB_id;
+        cout << "RF[8]: " << RF[8] << endl;
+    }
+    if (ROB_id == 5) {
+        exit(1);
+    }
+#endif
     if (!tmp.ready) {
         if (isStore(tmp.type)) {
             for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
@@ -724,13 +851,18 @@ void work_ROB() {
     }
     ROB_new.pop();
     if (hasRD(tmp.type)) {
+        CBD_update(ROB_id, tmp.value);
+        reg_new[tmp.rd] = tmp.value;
+        if (RF[tmp.rd] == ROB_id) {
+            RF_new[tmp.rd] = -1;
+        }
+        /*
         for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
             if (RF[i] == ROB_id) {
                 RF_new[i] = 0;
-                CBD_update(ROB_id, tmp.value);
                 reg_new[i] = tmp.value;
             }
-        }
+        }*/
     }
 
     if (isBranch(tmp.type)) {
@@ -741,7 +873,7 @@ void work_ROB() {
             if (FZYC[FZYC_modify_id] < 3) ++FZYC_new[FZYC_modify_id];
         } else {
             FZYC_modify_id = (tmp.imm & 0xFFF);
-            if (FZYC_modify_id > 0) --FZYC_new[FZYC_modify_id];
+            if (FZYC[FZYC_modify_id] > 0) --FZYC_new[FZYC_modify_id];
             pc_new = tmp.fact ? tmp.next_pc : tmp.pc + 4;
             predictFailFlag_new = true;
         }
@@ -762,6 +894,7 @@ void work_ROB() {
 
 
 void updateAll() {
+
     if (predictFailFlag) {
         predictFailFlag = false;
         return;
@@ -770,30 +903,76 @@ void updateAll() {
     ROB = ROB_new;
     SLB = SLB_new;
     pc = pc_new;
-    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) RS[i] = RS_new[i], RF[i] = RF_new[i], reg[i] = reg_new[i];
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+
+        RS[i] = RS_new[i], RF[i] = RF_new[i], reg[i] = reg_new[i];
+    }
+    RF[0] = RF_new[0] = -1, reg[0] = reg_new[0] = 0;
     flagEnd = flagEnd_new;
     flagEnd_new = false;
     predictFailFlag = predictFailFlag_new;
     predictFailFlag_new = false;
+    FZYC[FZYC_modify_id] = FZYC_new[FZYC_modify_id];
+}
+
+int getRSSize() {
+    int res = 0;
+    for (int i = 0; i < MAX_BUFFER_SIZE; ++i) res += RS[i].busy;
+    return res;
+}
+
+int getReadyROB() {
+    int res = 0;
+    for (int i = ROB.front_id();;++i) {
+        if (i == MAX_BUFFER_SIZE) i = 0;
+        res += ROB[i].ready;
+        if (i == ROB.back_id()) break;
+    }
+    return res;
 }
 
 int main() {
-    freopen("sample.data", "r", stdin);
-
+    //freopen("testcases/tak.data", "r", stdin);
+    //freopen("my.out", "w", stdout);
     initMemory();
     flagEnd = false;
     pc = 0;
     while (true) {
+        /*
+
+        if (ROB.front_id() == 7) {
+             cout<<"";
+                  /*
+         if (ROB.front_id() == 8) {
+             cout << hex<<ROB[8].pc << dec<<' ' << ROB[8].type << endl;
+             int pos = -1;
+             for (int i = 0; i < MAX_BUFFER_SIZE; ++i)
+                 if (RS[i].ROB_id == 8) {
+                     std::cout << RS[i].qj << ' ' << RS[i].qk << endl;
+                 }
+         }
+        */
+/*
+        cout << "Current pc: " << hex << pc << endl;
+        std::cout << "ROB size: " << dec<<ROB.size() << endl;
+        cout << "Ready ROB node: " << getReadyROB() <<"/" <<ROB.front_id()<< endl;
+        cout << "SLB size: " << SLB.size() << endl;
+        cout << "RS size: " << getRSSize() << endl;
+        cout << "ins_que size: " << insQue.size() << endl<<endl;
+*/
+        ++CLOCK;
         //posedge
         readInstruction();
-        issueInstruction();
         work_RS();
         work_SLB();
         work_ROB();
+        issueInstruction();
 
         //negedge
+        //if (predictFailFlag_new) clearAll();
         updateAll();
         if (flagEnd && insQue.empty() && ROB.empty() && !predictFailFlag) break;
     }
-    std::cout << (reg[10] & 255u);
+    std::cout << (reg[10] & 255u) << endl;
+    ///cout << predictSuccess << '/' << predictTot;
 }
